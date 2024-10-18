@@ -5,10 +5,9 @@ import os
 
 load_dotenv()
 
-connection_string:Optional[str] = os.getenv("DATABASEURL".replace(
-    "postgresql", "postgresql+psycopg"))
-if connection_string is None:
-    raise ValueError("DATABASEURL is not set")
+connection_string:Optional[str] = os.getenv('DATABASEURL')
+if not connection_string:
+    raise ValueError("DATABASE_URL environment variable not set")
 
 
 engine = create_engine(connection_string)
@@ -21,3 +20,5 @@ def create_table():
 def get_session():
     with Session(engine) as session:
         yield session
+
+    
