@@ -1,100 +1,110 @@
-from typing import Annotated
-from fastapi import FastAPI, Depends,HTTPException
-from sqlmodel import Session,select
+from sqlmodel import Session, select
+from .schema import User, UserCreate
+from passlib.context import CryptContext
+from fastapi import HTTPException, Depends
 from .db import get_session
-from  .schema import User,update_user,RegisterUser
-from passlib.context import CryptContext # type: ignore
 from passlib.exc import UnknownHashError
-from aiokafka import AIOKafkaProducer,AIOKafkaConsumer # type: ignore
-from .user_pb2 import Newuser # type: ignore
+from typing import Annotated, Optional
+from .Oauth import get_current_user  # Import the dependency for getting current user
 
-pwd_context = CryptContext(schemes=["bcrypt"],deprecated="auto")
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-async def produce_message():
-    producer = AIOKafkaProducer(bootstrap_servers='broker:19092')
-    await producer.start()
+# Verify password using the hashing algorithm
+def verify_password(plain_password, password):
     try:
-        # Produce message
-        yield producer
-    finally:
-        # Wait for all pending messages to be delivered or expire.
-        await producer.stop()
-
-
-def verify_password(plain_password,password):
-    try:
-        
-        return pwd_context.verify(plain_password,password)
+        return pwd_context.verify(plain_password, password)
     except UnknownHashError:
         print("Password hash could not be identified.")
-def get_password_hash(password: str):
+
+# Hash the password
+def hash_password(password: str) -> str:
     return pwd_context.hash(password)
 
-async def consume_messages(topic, bootstrap_servers):
-    # Create a consumer instance.
-    consumer = AIOKafkaConsumer(
-        topic,
-        bootstrap_servers=bootstrap_servers,
-        group_id="my-group",
-        auto_offset_reset='earliest'
-    )
-
-    # Start the consumer.
-    await consumer.start()
-    try:
-        # Continuously listen for messages.
-        async for message in consumer:
-            print(f"Received message: {message.value.decode()} on topic {message.topic}")
-            # Here you can add code to process each message.
-            # Example: parse the message, store it in a database, etc.
-    finally:
-        # Ensure to close the consumer when done.
-        await consumer.stop()
-
-
-
-async def db_user(session: Annotated[Session, Depends(get_session)],
-                   username: str | None = None,
-                   email: str | None = None):
-    statement = select(User).where(User.userName == username)
-    user = session.exec(statement).first()
+# Check if a user with the same name or email already exists
+def db_users(session: Annotated[Session, Depends(get_session)], user_data: UserCreate) -> Optional[User]:
+    statement = select(User).where((User.name == user_data.name) | (User.email == user_data.email))
+    user = session.exec(statement).first()  # Execute the statement properly
     
-    if not user:
-        statement = select(User).where(User.email == email)
-        user = session.exec(statement).first()
-        
+    if user is None:
+        return None 
     return user
 
-async def auth_user(username:str| None ,password:str,
-                     session: Annotated[Session, Depends(get_session)]
-                                    ):
-    data_user = await db_user(session=session,username=username)
-    if not data_user:
-        return False
-    if not verify_password(password,data_user.password):
-        return False
-    return data_user
-async def register_user(user:RegisterUser , session: Annotated[Session, Depends(get_session)],
-                        producer:Annotated[AIOKafkaProducer,Depends(produce_message)]):
-    existing_user = await db_user(username=user.user_name, email=user.email, session=session)  # Corrected call
+# Create a new user with role 'user' and password hashing
+def create_user(session: Annotated[Session, Depends(get_session)], user_data: UserCreate):
+    existing_user = db_users(session, user_data=user_data)
     if existing_user:
         raise HTTPException(status_code=400, detail="User already exists")
-    new_user = User(userName=user.user_name, email=user.email, password=get_password_hash(user.password))
-    user_data =Newuser(userName=new_user.userName, email=new_user.email)
-    serialized_user = user_data.SerializeToString()
-    await producer.send_and_wait('userService', serialized_user)
+    if not user_data.password:
+        raise HTTPException(status_code=400, detail="Password is required")
+    hashed_password = hash_password(user_data.password)
+
+    new_user = User(
+        name=user_data.name,
+        email=user_data.email,
+        password=hashed_password,
+        role="user",  # Default role as 'user'
+    )
     session.add(new_user)
     session.commit()
     session.refresh(new_user)
     return new_user
 
+# Get user by ID
+def get_user_by_id(session: Annotated[Session, Depends(get_session)], user_id: int, current_user: Annotated[User, Depends(get_current_user)]):
+    return session.exec(select(User).where(User.id == user_id)).first()
 
-async def user_patch_update(statement,edit_user):
-    if edit_user.user_name is not None and edit_user.user_name != "":
-        statement.user_name = edit_user.user_name
-    if edit_user.email is not None and edit_user.email != "":
-        statement.email = edit_user.email
-    if edit_user.password is not None and edit_user.password != "":
-        statement.password = get_password_hash(edit_user.password)
-    return statement
-        
+# Get all users
+def get_all_users(session: Annotated[Session, Depends(get_session)], current_user: Annotated[User, Depends(get_current_user)]):
+    return session.exec(select(User)).all()
+
+
+
+def update_user(
+    session: Session, 
+    user_id: int, 
+    update_data: User, 
+    current_user: Annotated[User, Depends(get_current_user)]
+) -> User:
+    user_to_update = get_user_by_id(session, user_id,current_user=current_user)
+    if user_to_update is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    if current_user.id != user_id and current_user.role != "super_admin":
+        raise HTTPException(status_code=403, detail="You can only update your own account")
+    if update_data.name is not None:
+        user_to_update.name = update_data.name
+    if update_data.email is not None:
+        user_to_update.email = update_data.email
+    if update_data.password is not None:
+        user_to_update.password = hash_password(update_data.password)
+    session.commit()
+    session.refresh(user_to_update)
+    
+    return user_to_update
+
+def delete_user(
+    session: Annotated[Session, Depends(get_session)], 
+    user_id: int, 
+    current_user: Annotated[User, Depends(get_current_user)]
+):
+    # Ensure that the current user can only delete their own account, or an admin or super admin can delete users
+    if current_user.id != user_id and current_user.role not in ["admin", "super_admin"]:
+        raise HTTPException(status_code=403, detail="You can only delete your own account, or an admin can delete users.")
+    
+    user_to_delete = get_user_by_id(session, user_id, current_user=current_user)
+    
+    if user_to_delete is None:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Admins can only delete users, not other admins or super admins
+    if current_user.role == "admin" and user_to_delete.role != "user":
+        raise HTTPException(status_code=403, detail="Admins can only delete users.")
+
+    # Super admins can only delete users with the role "user", not other admins or super admins
+    if current_user.role == "super_admin" and user_to_delete.role != "user":
+        raise HTTPException(status_code=403, detail="Super admins can only delete users.")
+
+    # Proceed with the deletion
+    session.delete(user_to_delete)
+    session.commit()
+
+    return {"message": "User deleted successfully"}

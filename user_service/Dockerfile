@@ -10,20 +10,15 @@ RUN apt-get update && apt-get install -y \
     protobuf-compiler \ 
     && rm -rf /var/lib/apt/lists/*
 
-# Install Poetry
 RUN pip install poetry
 
-# Copy the current directory contents into the container at /code
 COPY . /code/
-
-# Configuration to avoid creating virtual environments inside the Docker container
 RUN poetry config virtualenvs.create false
 
-# Install dependencies including development ones
 RUN poetry install
 
-# Make port 8000 available to the world outside this container
-EXPOSE 8000
+EXPOSE 8001
+CMD ["poetry", "run", "uvicorn", "user_service.main:app", "--host", "0.0.0.0", "--reload", "--log-level", "debug"]
 
-# Run the app. CMD can be overridden when starting the container
-CMD ["poetry", "run", "uvicorn", "user_service.main:app", "--host", "0.0.0.0", "--reload"]
+
+
